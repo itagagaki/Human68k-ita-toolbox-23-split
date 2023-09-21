@@ -2,12 +2,15 @@
 *
 * Itagaki Fumihiko 27-Feb-93  Create.
 * 1.0
+* Itagaki Fumihiko 26-Dec-93  Brush Up.
+* Itagaki Fumihiko 26-Dec-93  Add -l and -n.
+* 1.1
 *
-* Usage: split [ -cvZ ] [ -<N>[ckl] ] [ -- ] [ <ファイル> [ <出力ベース名> ] ]
+* Usage: split [ -clnvZ ] [ -<N>[ckl] ] [ -- ] [ <ファイル> [ <出力ベース名> ] ]
 
 .include doscall.h
+.include error.h
 .include limits.h
-.include stat.h
 .include chrcode.h
 
 .xref DecodeHUPAIR
@@ -17,22 +20,27 @@
 .xref strlen
 .xref stpcpy
 .xref strfor1
-.xref contains_dos_wildcard
+.xref memmovi
 .xref strip_excessive_slashes
+
+REQUIRED_OSVER	equ	$200			*  2.00以降
+
+DEFAULT_COUNT	equ	1000
 
 STACKSIZE	equ	2048
 
-OUTBUF_SIZE	equ	8192
-
-DEFAULT_COUNT	equ	1000
+INPBUFSIZE_MIN	equ	258
 
 CTRLD	equ	$04
 CTRLZ	equ	$1A
 
 FLAG_c		equ	0	*  -c
-FLAG_v		equ	1	*  -v
-FLAG_Z		equ	2	*  -Z
-FLAG_byte_unit	equ	3
+FLAG_l		equ	1	*  -l
+FLAG_n		equ	2	*  -n
+FLAG_v		equ	3	*  -v
+FLAG_Z		equ	4	*  -Z
+FLAG_byte_unit	equ	5
+FLAG_eof	equ	6
 
 .text
 
@@ -40,7 +48,12 @@ start:
 		bra.s	start1
 		dc.b	'#HUPAIR',0
 start1:
-		lea	stack_bottom(pc),a7		*  A7 := スタックの底
+		lea	bsstop(pc),a6
+		lea	stack_bottom(a6),a7	*  A7 := スタックの底
+		DOS	_VERNUM
+		cmp.w	#REQUIRED_OSVER,d0
+		bcs	dos_version_mismatch
+
 		lea	$10(a0),a0			*  A0 : PDBアドレス
 		move.l	a7,d0
 		sub.l	a0,d0
@@ -49,7 +62,7 @@ start1:
 		DOS	_SETBLOCK
 		addq.l	#8,a7
 	*
-		move.l	#-1,stdin
+		move.l	#-1,stdin(a6)
 	*
 	*  引数並び格納エリアを確保する
 	*
@@ -68,7 +81,7 @@ start1:
 		movea.l	a1,a0				*  A0 : 引数ポインタ
 		move.l	d0,d7				*  D7.L : 引数カウンタ
 		moveq	#0,d5				*  D5.B : フラグ
-		move.l	#DEFAULT_COUNT,count
+		move.l	#DEFAULT_COUNT,count(a6)
 decode_opt_loop1:
 		tst.l	d7
 		beq	decode_opt_done
@@ -95,6 +108,14 @@ decode_opt_loop1:
 decode_opt_loop2:
 		moveq	#FLAG_c,d1
 		cmp.b	#'c',d0
+		beq	set_option
+
+		moveq	#FLAG_l,d1
+		cmp.b	#'l',d0
+		beq	set_option
+
+		moveq	#FLAG_n,d1
+		cmp.b	#'n',d0
 		beq	set_option
 
 		moveq	#FLAG_v,d1
@@ -158,7 +179,7 @@ decode_count_unit_ok:
 		tst.b	(a0)+
 		bne	bad_count
 decode_count_ok:
-		move.l	d1,count
+		move.l	d1,count(a6)
 		bne	decode_opt_loop1
 bad_count:
 		lea	msg_illegal_count(pc),a0
@@ -167,26 +188,35 @@ bad_count:
 
 decode_opt_done:
 	*
+	*  -1c では -n を無効とする
+	*
+		cmp.l	#2,count(a6)
+		bhs	option_n_ok
+
+		bclr	#FLAG_n,d5
+option_n_ok:
+	*
 	*  入力バッファとして最大メモリを確保する
 	*
 		move.l	#$00ffffff,d0
 		bsr	malloc
 		sub.l	#$81000000,d0
-		cmp.l	#1024,d0
+		cmp.l	#INPBUFSIZE_MIN,d0
 		blo	insufficient_memory
 
-		move.l	d0,inpbuf_size
+		move.l	d0,inpbuf_size(a6)
 		bsr	malloc
 		bmi	insufficient_memory
 
-		move.l	d0,inpbuf
+		move.l	d0,inpbuf_top(a6)
+		move.l	d0,data_top(a6)
 	*
 	*  標準入力を切り替える
 	*
 		clr.w	-(a7)				*  標準入力を
 		DOS	_DUP				*  複製したハンドルから入力し，
 		addq.l	#2,a7
-		move.l	d0,stdin
+		move.l	d0,stdin(a6)
 		bmi	start_do_files
 
 		clr.w	-(a7)
@@ -219,7 +249,7 @@ do_arg:
 		bne	do_file
 do_stdin:
 		lea	msg_stdin(pc),a0
-		move.l	stdin,d1
+		move.l	stdin(a6),d0
 		bra	do_file_1
 
 do_file:
@@ -228,21 +258,23 @@ do_file:
 		move.l	a0,-(a7)
 		DOS	_OPEN
 		addq.l	#6,a7
-		move.l	d0,d1
 do_file_1:
 		lea	msg_open_fail(pc),a2
+		tst.l	d0
 		bmi	werror_exit_2
-							*  D1.L == input handle
-		move.l	a0,input_name
-		sf	eof
-		clr.l	byte_remain
+
+		move.w	d0,input_handle(a6)
+		move.l	a0,input_name(a6)
+		bclr	#FLAG_eof,d5
+		clr.l	byte_remain(a6)
+		sf	sjisflag(a6)
 	*
 	*  入力をtruncすべきかどうか決定する
 	*
 		btst	#FLAG_Z,d5
-		sne	ignore_from_ctrlz
-		sf	ignore_from_ctrld
-		move.w	d1,-(a7)
+		sne	ignore_from_ctrlz(a6)
+		sf	ignore_from_ctrld(a6)
+		move.w	input_handle(a6),-(a7)
 		clr.w	-(a7)
 		DOS	_IOCTRL
 		addq.l	#4,a7
@@ -255,13 +287,13 @@ do_file_1:
 		btst	#5,d0
 		bne	do_file_2			*  raw
 
-		st	ignore_from_ctrlz
-		st	ignore_from_ctrld
+		st	ignore_from_ctrlz(a6)
+		st	ignore_from_ctrld(a6)
 do_file_2:
 	*
 	*  最初の出力ファイル名を作成する
 	*
-		lea	output_name(pc),a0
+		lea	output_name(a6),a0
 		bsr	stpcpy
 		lea	str_dot000(pc),a1
 		bsr	stpcpy
@@ -271,39 +303,147 @@ do_file_2:
 	*
 do_file_loop:
 		moveq	#-1,d2				*  D2.L : 出力ファイルハンドル（-1 == 未作成 ... 最初のflush時に作成する）
-		move.l	#OUTBUF_SIZE,outbuf_free
-		lea	outbuf(pc),a5			*  A5 : 出力バッファのポインタ
-		move.l	count,d3			*  D3.L : 書き出しカウント
-output_one_loop:
-		bsr	getc
-		bmi	output_one_done
-
-		bsr	putc
+		move.l	count(a6),d3			*  D3.L : 書き出しカウント
 		btst	#FLAG_byte_unit,d5
-		bne	decrement_count
+		bne	byte_unit_loop
+****************
+line_unit_loop:
+		movea.l	data_top(a6),a0
+		move.l	byte_remain(a6),d0
+		bne	line_unit_1
 
-		cmp.b	#LF,d0
-		bne	output_one_loop
-decrement_count:
+		move.l	inpbuf_size(a6),d0
+		bsr	read
+		move.l	d0,byte_remain(a6)
+		beq	done_one
+line_unit_1:
+line_unit_count_loop:
+		subq.l	#1,d0
+		bcs	line_unit_count_done
+
+		cmpi.b	#LF,(a0)+
+		bne	line_unit_count_loop
+
 		subq.l	#1,d3
-		bne	output_one_loop
-output_one_done:
-		move.l	d0,-(a7)
-		bsr	flush_outbuf
+		bne	line_unit_count_loop
+line_unit_count_done:
+		move.l	a0,d0
+		sub.l	data_top(a6),d0
+		bsr	write
+		tst.l	d3
+		bne	line_unit_loop
+		bra	done_one
+****************
+byte_unit_loop:
+		st	doneflag(a6)
+		move.l	d3,d4
+		cmp.l	byte_remain(a6),d4
+		blo	byte_unit_check_l
+
+		movea.l	data_top(a6),a1
+		movea.l	inpbuf_top(a6),a0
+		move.l	byte_remain(a6),d0
+		cmpa.l	a0,a1
+		bne	byte_unit_read_more_1
+
+		adda.l	d0,a0
+		bra	byte_unit_read_more_2
+
+byte_unit_read_more_1:
+		move.l	a0,data_top(a6)
+		bsr	memmovi
+byte_unit_read_more_2:
+		move.l	inpbuf_size(a6),d0
+		sub.l	byte_remain(a6),d0
+		beq	byte_unit_read_more_3
+
+		bsr	read
+		add.l	d0,byte_remain(a6)
+		cmp.l	byte_remain(a6),d4
+		blo	byte_unit_check_l
+byte_unit_read_more_3:
+		move.l	byte_remain(a6),d4
+		beq	done_one
+
+		btst	#FLAG_eof,d5
+		bne	byte_unit_output
+
+		cmp.l	d3,d4
+		seq	doneflag(a6)
+byte_unit_check_l:
+		btst	#FLAG_l,d5
+		beq	byte_unit_check_n
+
+		movea.l	data_top(a6),a0
+		adda.l	d4,a0
+		move.l	d4,d0
+byte_unit_find_newline:
+		cmpi.b	#LF,-(a0)
+		beq	byte_unit_newline_found
+
+		subq.l	#1,d0
+		bne	byte_unit_find_newline
+
+		tst.b	doneflag(a6)
+		beq	insufficient_memory
+
+		cmp.l	count(a6),d3
+		beq	byte_unit_output
+		bra	done_one
+
+byte_unit_newline_found:
+		move.l	d0,d4
+		bra	byte_unit_output
+
+byte_unit_check_n:
+		btst	#FLAG_n,d5
+		beq	byte_unit_output
+
+		movea.l	data_top(a6),a0
+		move.l	d4,d1
+byte_unit_check_n_loop:
+		move.b	(a0)+,d0
+		not.b	sjisflag(a6)
+		beq	byte_unit_check_n_1
+
+		bsr	issjis
+		seq	sjisflag(a6)
+byte_unit_check_n_1:
+		subq.l	#1,d1
+		bne	byte_unit_check_n_loop
+
+		tst.b	doneflag(a6)
+		beq	byte_unit_output
+
+		tst.b	sjisflag(a6)
+		beq	byte_unit_output
+
+		subq.l	#1,d4
+byte_unit_output:
+		move.l	d4,d0
+		bsr	write
+		sub.l	d4,d3
+		tst.b	doneflag(a6)
+		beq	byte_unit_loop
+****************
+done_one:
 		tst.l	d2
-		bmi	output_close_done
+		bmi	close_done
 
 		move.w	d2,-(a7)
 		DOS	_CLOSE
 		addq.l	#2,a7
 		tst.l	d0
 		bmi	write_fail
-output_close_done:
-		move.l	(a7)+,d0
-		bmi	all_done
+close_done:
+		tst.l	byte_remain(a6)
+		bne	make_next_name
 
-		movea.l	a3,a0
+		btst	#FLAG_eof,d5
+		bne	all_done
 make_next_name:
+		movea.l	a3,a0
+make_next_name_loop:
 		cmpi.b	#'.',-(a0)
 		beq	too_many_outputs
 
@@ -312,11 +452,11 @@ make_next_name:
 		bls	do_file_loop
 
 		move.b	#'0',(a0)
-		bra	make_next_name
+		bra	make_next_name_loop
 
 all_done:
 exit_program:
-		move.l	stdin,d0
+		move.l	stdin(a6),d0
 		bmi	exit_program_1
 
 		clr.w	-(a7)				*  標準入力を
@@ -347,54 +487,9 @@ werror_exit_1:
 		bsr	werror
 		moveq	#1,d6
 		bra	exit_program
-*****************************************************************
-getc:
-		tst.l	byte_remain
-		bne	getc_1
-
-		tst.b	eof
-		bne	read_done
-
-		movea.l	inpbuf,a2
-		move.l	inpbuf_size,-(a7)
-		move.l	a2,-(a7)
-		move.w	d1,-(a7)
-		DOS	_READ
-		lea	10(a7),a7
-		move.l	d0,byte_remain
-		bmi	read_fail
-
-		tst.b	ignore_from_ctrlz
-		beq	trunc_ctrlz_done
-
-		moveq	#CTRLZ,d0
-		bsr	trunc
-trunc_ctrlz_done:
-		tst.b	ignore_from_ctrld
-		beq	trunc_ctrld_done
-
-		moveq	#CTRLD,d0
-		bsr	trunc
-trunc_ctrld_done:
-read_done:
-		move.l	byte_remain,d0
-		beq	getc_eof
-getc_1:
-		moveq	#0,d0
-		move.b	(a2)+,d0
-		sub.l	#1,byte_remain
-		cmp.b	d0,d0
-		rts
-
-getc_eof:
-		clr.l	byte_remain
-		st	eof
-		moveq	#-1,d0
-		rts
 
 read_fail:
-		bsr	flush_outbuf
-		movea.l	input_name,a0
+		movea.l	input_name(a6),a0
 		lea	msg_read_fail(pc),a2
 werror_exit_2:
 		bsr	werror_myname_and_msg
@@ -404,79 +499,37 @@ exit_2:
 		moveq	#2,d6
 		bra	exit_program
 *****************************************************************
-trunc:
-		tst.l	byte_remain
-		beq	trunc_return
+write:
+		tst.l	d0
+		beq	write_return
 
-		move.l	d1,-(a7)
-		movea.l	inpbuf,a0
-		movea.l	a0,a1
-		move.l	byte_remain,d1
-trunc_find_loop:
-		cmp.b	(a0)+,d0
-		beq	trunc_found
-
-		subq.l	#1,d1
-		bne	trunc_find_loop
-		bra	trunc_done
-
-trunc_found:
-		subq.l	#1,a0
-		move.l	a0,d0
-		sub.l	a1,d0
-		move.l	d0,byte_remain
-		st	eof
-trunc_done:
-		move.l	(a7)+,d1
-trunc_return:
-		rts
-*****************************************************************
-putc:
-		tst.l	outbuf_free
-		bne	putc_1
-
-		bsr	flush_outbuf
-putc_1:
-		move.b	d0,(a5)+
-		subq.l	#1,outbuf_free
-putc_done:
-		rts
-*****************************************************************
-flush_outbuf:
 		move.l	d0,-(a7)
-		move.l	#OUTBUF_SIZE,d0
-		cmp.l	outbuf_free,d0
-		beq	flush_done
-
 		tst.l	d2
-		bpl	do_flush_outbuf
+		bpl	write_1
 
-		*  1回目のflush ... ファイルを作成する
+		*  1回目のwrite ... ファイルを作成する
 
-			lea	output_name(pc),a0
-			bsr	contains_dos_wildcard
-			bne	create_fail
-
-			btst	#FLAG_c,d5
-			beq	do_create
-
-			move.w	#MODEVAL_ALL,-(a7)
+			lea	output_name(a6),a0
+			move.w	#$20,-(a7)
 			move.l	a0,-(a7)
-			pea	filesbuf(pc)
-			DOS	_FILES
-			lea	10(a7),a7
-			tst.l	d0
-			bpl	file_exists
-do_create:
-			move.w	#$20,-(a7)		*  通常のファイルモードで
-			move.l	a0,-(a7)		*  出力先ファイルを
-			DOS	_CREATE			*  新規作成する
+			btst	#FLAG_c,d5
+			beq	create
+
+			DOS	_NEWFILE
+			bra	create_1
+
+create:
+			DOS	_CREATE
+create_1:
 			addq.l	#6,a7
+			cmp.l	#ENEWFILEEXISTS,d0
+			beq	file_exists
+
 			move.l	d0,d2			*  D2.L : output handle
 			bmi	create_fail
 
 			btst	#FLAG_v,d5
-			beq	do_flush_outbuf
+			beq	write_1
 
 			move.l	a0,-(a7)
 			DOS	_PRINT
@@ -484,12 +537,9 @@ do_create:
 			pea	msg_newline(pc)
 			DOS	_PRINT
 			addq.l	#4,a7
-do_flush_outbuf:
+write_1:
 		*  書き出す
-		move.l	#OUTBUF_SIZE,d0
-		sub.l	outbuf_free,d0
-		move.l	d0,-(a7)
-		pea	outbuf(pc)
+		move.l	data_top(a6),-(a7)
 		move.w	d2,-(a7)
 		DOS	_WRITE
 		lea	10(a7),a7
@@ -499,11 +549,9 @@ do_flush_outbuf:
 		cmp.l	-4(a7),d0
 		blo	write_fail
 
-		lea	outbuf(pc),a5
-		move.l	#OUTBUF_SIZE,d0
-		move.l	d0,outbuf_free
-flush_done:
-		move.l	(a7)+,d0
+		add.l	d0,data_top(a6)
+		sub.l	d0,byte_remain(a6)
+write_return:
 		rts
 
 file_exists:
@@ -511,21 +559,82 @@ file_exists:
 		bra	werror_exit_2
 
 create_fail:
-		lea	output_name(pc),a0
+		lea	output_name(a6),a0
 		lea	msg_create_fail(pc),a2
 		bra	werror_exit_2
 
 write_fail:
-		lea	output_name(pc),a0
+		lea	output_name(a6),a0
 		lea	msg_write_fail(pc),a2
-werror_exit_3:
 		bsr	werror_myname_and_msg
 		movea.l	a2,a0
 		bsr	werror
 		bra	exit_3
 *****************************************************************
+read:
+		btst	#FLAG_eof,d5
+		bne	read_eof
+
+		move.l	d0,-(a7)
+		move.l	a0,-(a7)
+		move.w	input_handle(a6),-(a7)
+		DOS	_READ
+		lea	10(a7),a7
+		tst.l	d0
+		bmi	read_fail
+		beq	read_eof
+
+		tst.b	ignore_from_ctrlz(a6)
+		beq	trunc_ctrlz_done
+
+		moveq	#CTRLZ,d1
+		bsr	trunc
+trunc_ctrlz_done:
+		tst.b	ignore_from_ctrld(a6)
+		beq	trunc_ctrld_done
+
+		moveq	#CTRLD,d1
+		bsr	trunc
+trunc_ctrld_done:
+		rts
+
+read_eof:
+		bset	#FLAG_eof,d5
+		moveq	#0,d0
+		rts
+*****************************************************************
+trunc:
+		tst.l	d0
+		beq	trunc_return
+
+		movem.l	d2/a1,-(a7)
+		movea.l	a0,a1
+		move.l	d0,d2
+trunc_find_loop:
+		cmp.b	(a1)+,d1
+		beq	trunc_found
+
+		subq.l	#1,d2
+		bne	trunc_find_loop
+		bra	trunc_done
+
+trunc_found:
+		subq.l	#1,a1
+		move.l	a1,d0
+		sub.l	a0,d0
+		bset	#FLAG_eof,d5
+trunc_done:
+		movem.l	(a7)+,d2/a1
+trunc_return:
+		rts
+*****************************************************************
+dos_version_mismatch:
+		lea	msg_dos_version_mismatch(pc),a0
+		bra	werror_exit_3
+*****************************************************************
 insufficient_memory:
 		lea	msg_no_memory(pc),a0
+werror_exit_3:
 		bsr	werror_myname_and_msg
 exit_3:
 		moveq	#3,d6
@@ -567,47 +676,52 @@ malloc:
 .data
 
 	dc.b	0
-	dc.b	'## split 1.0 ##  Copyright(C)1993 by Itagaki Fumihiko',0
+	dc.b	'## split 1.1 ##  Copyright(C)1993-94 by Itagaki Fumihiko',0
 
-msg_myname:		dc.b	'split: ',0
-msg_no_memory:		dc.b	'メモリが足りません',CR,LF,0
-msg_too_many_outputs:	dc.b	'出力ファイル数が多過ぎます',CR,LF,0
-msg_open_fail:		dc.b	': オープンできません',CR,LF,0
-msg_create_fail:	dc.b	': 作成できません',CR,LF,0
-msg_file_exists:	dc.b	': ファイルが存在しています',CR,LF,0
-msg_too_long_basename:	dc.b	': 出力ベース名が長過ぎます',CR,LF,0
-msg_read_fail:		dc.b	': 入力エラー',CR,LF,0
-msg_write_fail:		dc.b	': 出力エラー',CR,LF,0
-msg_illegal_option:	dc.b	'不正なオプション -- ',0
-msg_illegal_count:	dc.b	'カウントの指定が不正です',0
-msg_too_many_args:	dc.b	'引数が多過ぎます',0
-msg_usage:		dc.b	CR,LF,'使用法:  split [-cvZ] [-<N>[ckl]] [--] [ <ファイル> [<出力ベース名>] ]'
-msg_newline:		dc.b	CR,LF,0
-msg_stdin:		dc.b	'- 標準入力 -',0
-default_basename:	dc.b	'x',0
-str_dot000:		dc.b	'.000',0
+msg_myname:			dc.b	'split: ',0
+msg_dos_version_mismatch:	dc.b	'バージョン2.00以降のHuman68kが必要です',CR,LF,0
+msg_no_memory:			dc.b	'メモリが足りません',CR,LF,0
+msg_too_many_outputs:		dc.b	'出力ファイル数が多過ぎます',CR,LF,0
+msg_open_fail:			dc.b	': オープンできません',CR,LF,0
+msg_create_fail:		dc.b	': 作成できません',CR,LF,0
+msg_file_exists:		dc.b	': ファイルが存在しています',CR,LF,0
+msg_too_long_basename:		dc.b	': 出力ベース名が長過ぎます',CR,LF,0
+msg_read_fail:			dc.b	': 入力エラー',CR,LF,0
+msg_write_fail:			dc.b	': 出力エラー',CR,LF,0
+msg_illegal_option:		dc.b	'不正なオプション -- ',0
+msg_illegal_count:		dc.b	'カウントの指定が不正です',0
+msg_too_many_args:		dc.b	'引数が多過ぎます',0
+msg_usage:			dc.b	CR,LF,'使用法:  split [-clnvZ] [-<N>[ckl]] [--] [ <ファイル> [<出力ベース名>] ]'
+msg_newline:			dc.b	CR,LF,0
+msg_stdin:			dc.b	'- 標準入力 -',0
+default_basename:		dc.b	'x',0
+str_dot000:			dc.b	'.000',0
 *****************************************************************
 .bss
 
 .even
+bsstop:
+.offset 0
 stdin:			ds.l	1
-inpbuf:			ds.l	1
+inpbuf_top:		ds.l	1
 inpbuf_size:		ds.l	1
-outbuf_free:		ds.l	1
+data_top:		ds.l	1
 count:			ds.l	1
 byte_remain:		ds.l	1
 input_name:		ds.l	1
-output_name:		ds.b	MAXPATH+1
-.even
-filesbuf:		ds.b	STATBUFSIZE
+input_handle:		ds.w	1
 ignore_from_ctrlz:	ds.b	1
 ignore_from_ctrld:	ds.b	1
-eof:			ds.b	1
-outbuf:			ds.b	OUTBUF_SIZE
-
-		ds.b	STACKSIZE
+sjisflag:		ds.b	1
+doneflag:		ds.b	1
+output_name:		ds.b	MAXPATH+1
+.even
+			ds.b	STACKSIZE
 .even
 stack_bottom:
+
+.bss
+			ds.b	stack_bottom
 *****************************************************************
 
 .end start

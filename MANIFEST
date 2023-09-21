@@ -1,0 +1,6 @@
+MANIFEST       このファイル
+README         まず最初にお読み下さい
+NOTICE         版権と許諾についての告示書
+CHANGES        splitのモデルチェンジの履歴
+split.1        splitのマニュアル
+split.x        split実行ファイル
